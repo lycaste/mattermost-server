@@ -420,7 +420,7 @@ func (a *App) createGroupChannel(userIds []string, creatorId string) (*model.Cha
 		return nil, model.NewAppError("CreateGroupChannel", "api.channel.create_group.bad_size.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	result := <-a.Srv.Store.User().GetProfileByIds(userIds, true)
+	result := <-a.Srv.Store.User().GetProfileByIds(userIds, true, nil)
 	if result.Err != nil {
 		return nil, result.Err
 	}
@@ -469,7 +469,7 @@ func (a *App) GetGroupChannel(userIds []string) (*model.Channel, *model.AppError
 		return nil, model.NewAppError("GetGroupChannel", "api.channel.create_group.bad_size.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	result := <-a.Srv.Store.User().GetProfileByIds(userIds, true)
+	result := <-a.Srv.Store.User().GetProfileByIds(userIds, true, nil)
 	if result.Err != nil {
 		return nil, result.Err
 	}
@@ -833,7 +833,7 @@ func (a *App) DeleteChannel(channel *model.Channel, userId string) *model.AppErr
 	}
 
 	for _, hook := range outgoingHooks {
-		if result := <-a.Srv.Store.Webhook().DeleteOutgoing(hook.Id, now); result.Err != nil {
+		if err := a.Srv.Store.Webhook().DeleteOutgoing(hook.Id, now); err != nil {
 			mlog.Error(fmt.Sprintf("Encountered error deleting outgoing webhook, id=%v", hook.Id))
 		}
 	}
@@ -915,7 +915,7 @@ func (a *App) AddUserToChannel(user *model.User, channel *model.Channel) (*model
 	return newMember, nil
 }
 
-func (a *App) AddChannelMember(userId string, channel *model.Channel, userRequestorId string, postRootId string, currentSessionId string) (*model.ChannelMember, *model.AppError) {
+func (a *App) AddChannelMember(userId string, channel *model.Channel, userRequestorId string, postRootId string) (*model.ChannelMember, *model.AppError) {
 	if member, err := a.Srv.Store.Channel().GetMember(channel.Id, userId); err != nil {
 		if err.Id != store.MISSING_CHANNEL_MEMBER_ERROR {
 			return nil, err
@@ -968,10 +968,6 @@ func (a *App) AddChannelMember(userId string, channel *model.Channel, userReques
 		a.Srv.Go(func() {
 			a.PostAddToChannelMessage(userRequestor, user, channel, postRootId)
 		})
-	}
-
-	if userRequestor != nil {
-		a.MarkChannelsAsViewed([]string{channel.Id}, userRequestor.Id, currentSessionId)
 	}
 
 	return cm, nil
@@ -1109,16 +1105,16 @@ func (a *App) PostUpdateChannelDisplayNameMessage(userId string, channel *model.
 }
 
 func (a *App) GetChannel(channelId string) (*model.Channel, *model.AppError) {
-	result := <-a.Srv.Store.Channel().Get(channelId, true)
-	if result.Err != nil {
-		if result.Err.Id == "store.sql_channel.get.existing.app_error" {
-			result.Err.StatusCode = http.StatusNotFound
-			return nil, result.Err
+	channel, errCh := a.Srv.Store.Channel().Get(channelId, true)
+	if errCh != nil {
+		if errCh.Id == "store.sql_channel.get.existing.app_error" {
+			errCh.StatusCode = http.StatusNotFound
+			return nil, errCh
 		}
-		result.Err.StatusCode = http.StatusBadRequest
-		return nil, result.Err
+		errCh.StatusCode = http.StatusBadRequest
+		return nil, errCh
 	}
-	return result.Data.(*model.Channel), nil
+	return channel, nil
 }
 
 func (a *App) GetChannelByName(channelName, teamId string, includeDeleted bool) (*model.Channel, *model.AppError) {
@@ -1424,7 +1420,13 @@ func (a *App) postJoinTeamMessage(user *model.User, channel *model.Channel) *mod
 }
 
 func (a *App) LeaveChannel(channelId string, userId string) *model.AppError {
-	sc := a.Srv.Store.Channel().Get(channelId, true)
+	sc := make(chan store.StoreResult, 1)
+	go func() {
+		channel, err := a.Srv.Store.Channel().Get(channelId, true)
+		sc <- store.StoreResult{Data: channel, Err: err}
+		close(sc)
+	}()
+
 	uc := make(chan store.StoreResult, 1)
 	go func() {
 		user, err := a.Srv.Store.User().Get(userId)
@@ -1763,12 +1765,11 @@ func (a *App) MarkChannelsAsViewed(channelIds []string, userId string, currentSe
 	channelsToClearPushNotifications := []string{}
 	if *a.Config().EmailSettings.SendPushNotifications {
 		for _, channelId := range channelIds {
-			chanResult := <-a.Srv.Store.Channel().Get(channelId, true)
-			if chanResult.Err != nil {
-				mlog.Warn(fmt.Sprintf("Failed to get channel %v", chanResult.Err))
+			channel, errCh := a.Srv.Store.Channel().Get(channelId, true)
+			if errCh != nil {
+				mlog.Warn(fmt.Sprintf("Failed to get channel %v", errCh))
 				continue
 			}
-			channel := chanResult.Data.(*model.Channel)
 
 			member, err := a.Srv.Store.Channel().GetMember(channelId, userId)
 			if err != nil {
@@ -1852,12 +1853,12 @@ func (a *App) PermanentDeleteChannel(channel *model.Channel) *model.AppError {
 		return result.Err
 	}
 
-	if result := <-a.Srv.Store.Webhook().PermanentDeleteIncomingByChannel(channel.Id); result.Err != nil {
-		return result.Err
+	if err := a.Srv.Store.Webhook().PermanentDeleteIncomingByChannel(channel.Id); err != nil {
+		return err
 	}
 
-	if result := <-a.Srv.Store.Webhook().PermanentDeleteOutgoingByChannel(channel.Id); result.Err != nil {
-		return result.Err
+	if err := a.Srv.Store.Webhook().PermanentDeleteOutgoingByChannel(channel.Id); err != nil {
+		return err
 	}
 
 	if result := <-a.Srv.Store.Channel().PermanentDelete(channel.Id); result.Err != nil {
@@ -1906,7 +1907,7 @@ func (a *App) MoveChannel(team *model.Team, channel *model.Channel, user *model.
 	}
 
 	if len(channelMemberIds) > 0 {
-		teamMembers, err2 := a.GetTeamMembersByIds(team.Id, channelMemberIds)
+		teamMembers, err2 := a.GetTeamMembersByIds(team.Id, channelMemberIds, nil)
 		if err2 != nil {
 			return err2
 		}
@@ -1917,12 +1918,10 @@ func (a *App) MoveChannel(team *model.Team, channel *model.Channel, user *model.
 	}
 
 	// keep instance of the previous team
-	var previousTeam *model.Team
-	result := <-a.Srv.Store.Team().Get(channel.TeamId)
-	if result.Err != nil {
-		return result.Err
+	previousTeam, err := a.Srv.Store.Team().Get(channel.TeamId)
+	if err != nil {
+		return err
 	}
-	previousTeam = result.Data.(*model.Team)
 
 	channel.TeamId = team.Id
 	if result := <-a.Srv.Store.Channel().Update(channel); result.Err != nil {
